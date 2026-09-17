@@ -1,0 +1,79 @@
+name: Check upstream releases
+
+on:
+  schedule:
+    - cron: '30 7 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # commit version records + heartbeat
+  issues: write   # open the notification issue
+
+concurrency:
+  group: upstream-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      # aiohttp is one of nvchecker's supported HTTP backends; installing it
+      # explicitly avoids depending on which one the wheel happens to pull in.
+      - name: Install nvchecker
+        run: pip install --disable-pip-version-check nvchecker aiohttp
+
+      # --json-log-fd=3 keeps the structured log on its own descriptor, so
+      # nothing else nvchecker prints can contaminate it.
+      - name: Run nvchecker
+        run: nvchecker -c nvchecker.toml --logger=json --json-log-fd=3 3>nvchecker.log
+
+      - name: Collect updates
+        id: updates
+        run: |
+          jq -r 'select(.event == "updated")
+                 | "- **\(.name)**: `\(.old_version // "none")` → `\(.version)`"' \
+            nvchecker.log > updates.md
+          jq -r 'select(.event == "updated") | .name' nvchecker.log > updated-names.txt
+          if [ -s updates.md ]; then echo "found=true" >> "$GITHUB_OUTPUT"; fi
+          cat updates.md
+
+      - name: Open an issue
+        if: steps.updates.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "New upstream version(s) detected:"
+            echo
+            cat updates.md
+            echo
+            echo "Bump \`pkgver\`, refresh \`sha256sums\`, bump \`pkgrel\`, push to the AUR,"
+            echo "then close this issue."
+          } > issue-body.md
+          gh issue create \
+            --title "Upstream update: $(paste -sd', ' updated-names.txt)" \
+            --body-file issue-body.md
+
+      # nvtake marks the new versions as known, so the next run stays quiet
+      # until upstream moves again. Skipped if the issue step failed.
+      - name: Record new versions
+        if: steps.updates.outputs.found == 'true'
+        run: xargs -r -a updated-names.txt nvtake -c nvchecker.toml
+
+      # old_ver.json only changes on release days, so it cannot double as the
+      # heartbeat. This timestamp is rewritten every run, guaranteeing repo
+      # activity and stopping GitHub disabling the schedule after 60 days.
+      - name: Commit records and heartbeat
+        run: |
+          date -u +%FT%TZ > last-check
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last-check old_ver.json
+          git diff --cached --quiet || git commit -m "chore: upstream check [skip ci]"
+          git push
